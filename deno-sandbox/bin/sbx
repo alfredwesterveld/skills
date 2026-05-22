@@ -1,0 +1,76 @@
+#!/usr/bin/env -S deno run -A
+// sbx — run shell command in a remote Deno Deploy sandbox.
+//
+// Usage:
+//   sbx <cmd...>                # args joined with spaces, run in sandbox
+//   echo "cmd" | sbx -          # read command from stdin
+//   sbx --json <cmd...>         # emit JSON {code, stdout, stderr}
+//
+// Token resolution (first hit wins):
+//   1. $DENO_DEPLOY_TOKEN
+//   2. macOS Keychain: account=$USER, service=DENO_DEPLOY_TOKEN
+//
+// Exit code mirrors the sandboxed process.
+
+import { Sandbox } from "npm:@deno/sandbox";
+
+async function loadToken(): Promise<string> {
+  const env = Deno.env.get("DENO_DEPLOY_TOKEN");
+  if (env && env.trim()) return env.trim();
+
+  const user = Deno.env.get("USER") ?? "";
+  const p = new Deno.Command("security", {
+    args: ["find-generic-password", "-a", user, "-s", "DENO_DEPLOY_TOKEN", "-w"],
+    stdout: "piped",
+    stderr: "piped",
+  });
+  const out = await p.output();
+  if (!out.success) {
+    console.error("sbx: no DENO_DEPLOY_TOKEN in env and not found in macOS keychain");
+    console.error("     store with: security add-generic-password -a \"$USER\" -s DENO_DEPLOY_TOKEN -w");
+    Deno.exit(2);
+  }
+  return new TextDecoder().decode(out.stdout).trim();
+}
+
+function parseArgs(argv: string[]): { json: boolean; cmd: string } {
+  const args = [...argv];
+  let json = false;
+  if (args[0] === "--json") {
+    json = true;
+    args.shift();
+  }
+  let cmd: string;
+  if (args.length === 1 && args[0] === "-") {
+    cmd = new TextDecoder().decode(Deno.readAllSync(Deno.stdin));
+  } else {
+    cmd = args.join(" ");
+  }
+  if (!cmd.trim()) {
+    console.error("usage: sbx [--json] <command...>   |   echo <cmd> | sbx -");
+    Deno.exit(2);
+  }
+  return { json, cmd };
+}
+
+const { json, cmd } = parseArgs(Deno.args);
+Deno.env.set("DENO_DEPLOY_TOKEN", await loadToken());
+
+await using sandbox = await Sandbox.create();
+
+// Tagged-template invocation with a dynamic string.
+const tsa = Object.assign([cmd], { raw: [cmd] }) as unknown as TemplateStringsArray;
+const result = await (sandbox as any).sh(tsa);
+
+const stdout = result.stdoutText ?? "";
+const stderr = result.stderrText ?? "";
+const code = result.status?.code ?? (result.status?.success ? 0 : 1);
+
+if (json) {
+  console.log(JSON.stringify({ code, stdout, stderr }));
+} else {
+  if (stdout) Deno.stdout.writeSync(new TextEncoder().encode(stdout));
+  if (stderr) Deno.stderr.writeSync(new TextEncoder().encode(stderr));
+}
+
+Deno.exit(code);
