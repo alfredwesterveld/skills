@@ -1,7 +1,7 @@
 ---
 name: visual-qa-crawl
-description: Autonomous visual QA crawler for systematic UI issue detection. Crawls all site pages (or a filtered subset), takes full-page desktop (1280×900) and mobile (393×878) screenshots, and identifies visual issues (overflow, layout breaks, overlapping elements, contrast problems, unreadable text). Returns a structured markdown report of found issues with severity ratings. Use when you want to audit the visual health of the entire site or a specific locale/page.
-allowed-tools: Bash(agent-browser:*), Bash(bun run:check:dev-server), Bash(*:wait), Bash(bd:*), Write
+description: Autonomous visual QA crawler for systematic UI issue detection. Crawls reachable pages of any site, takes full-page desktop and mobile screenshots, and identifies visual issues (overflow, layout breaks, overlapping elements, contrast problems, unreadable text). Returns a structured markdown report with severity ratings. Use to audit visual health of a site, a locale, or a single page.
+allowed-tools: Bash(agent-browser:*), Bash(bd:*), Bash(npm:*), Bash(bun:*), Bash(pnpm:*), Bash(yarn:*), Bash(curl:*), Bash(source:*), Read, Write
 hidden: false
 ---
 
@@ -9,121 +9,153 @@ hidden: false
 
 ## Overview
 
-This skill crawls every page of the site (or a filtered subset), takes full-page screenshots at desktop and mobile viewports, and identifies visual UI issues using vision analysis.
+Project-agnostic crawler. Walks every reachable page of a site (or filtered subset), screenshots desktop + mobile, runs a programmatic overflow scan, then applies vision analysis. Outputs a markdown issues table.
 
-**What it checks:**
-- Text clipping or overflow outside containers/buttons
+**What it checks**
+- Text clipping / overflow outside containers
 - Elements overlapping unintentionally
-- Content bleeding off-screen at specified viewport widths
-- Contrast issues (unreadable text)
-- Broken grid / layout shifts
-- Mobile-specific issues: horizontal scroll, hamburger menu visibility, touch target overlap, hero layout on narrow viewport
+- Content bleeding off the right edge
+- Contrast / unreadable text
+- Broken grid or layout shift
+- Mobile horizontal scroll, clipped nav, sub-14px text, hero collapse, card-content clipping
 
-**What it does NOT duplicate:**
-- Existing Playwright gates already cover WCAG contrast, axe accessibility, overflow widths, CLS, FOUT via automated checks. This skill is the **holistic human-vision layer** — finding layout breaks and visual incoherence that automated checks miss.
+**What it does not do**
+- Does not replace WCAG / axe / Playwright contrast gates. This is the **holistic vision layer** that catches incoherence automated checks miss.
+- Does not interact with overlays, forms, modals, language switchers by default. Captures default-state render.
+
+## Configuration
+
+Place `visual-qa.config.json` in target repo root. All keys optional.
+
+```json
+{
+  "baseUrl": "http://localhost:3000",
+  "devCheckCmd": "npm run dev:check",
+  "fallbackUrl": "https://example.com",
+  "viewports": { "desktop": [1280, 900], "mobile": [393, 878] },
+  "seedUrls": ["/", "/about", "/contact"],
+  "locales": { "en": "/en/", "de": "/de/" },
+  "overflowSelectors": "[class*=\"card\"], button, [role=\"button\"], nav a, td, th, h1, h2, h3, p",
+  "skipInteractions": ["hamburger", "language-switch"],
+  "componentNotes": "FAQ collapsed. Forms idle. No modals opened.",
+  "extraDesktopChecks": [],
+  "extraMobileChecks": [],
+  "maxPages": 200
+}
+```
+
+If no config file and no `--base-url` flag, the skill aborts.
 
 ## Usage
 
 ```bash
-/visual-qa-crawl
-```
-
-**With optional filters:**
-```bash
-/visual-qa-crawl --locale nl
-/visual-qa-crawl --page contact
-/visual-qa-crawl --mobile-only
+/visual-qa-crawl                                # use ./visual-qa.config.json
+/visual-qa-crawl --base-url http://localhost:5173
+/visual-qa-crawl --locale en --mobile-only
+/visual-qa-crawl --page contact --desktop-only
+/visual-qa-crawl --config ./qa.json --max-pages 50
+/visual-qa-crawl --no-bfs                        # crawl only seedUrls, no link discovery
 ```
 
 ## Options
 
 | Option | Values | Default | Description |
 |--------|--------|---------|-------------|
-| `--locale` | `nl`, `en`, `de` | all three | Crawl only one locale (e.g., `--locale en`) |
-| `--page` | slug (e.g., `contact`) | all pages | Crawl a single page by slug (e.g., `--page contact` crawls `/contact/`, `/en/contact/`, `/de/contact/`) |
-| `--desktop-only` | flag | crawl both | Skip mobile viewport pass (1280×900 only) |
-| `--mobile-only` | flag | crawl both | Skip desktop viewport pass (393×878 only) |
+| `--base-url` | URL | from config | Override base domain |
+| `--config` | path | `./visual-qa.config.json` | Explicit config path |
+| `--locale` | locale key from config | all | Crawl only URLs under one locale prefix |
+| `--page` | slug | all pages | Crawl only paths whose final segment matches slug |
+| `--desktop-only` | flag | both | Skip mobile pass |
+| `--mobile-only` | flag | both | Skip desktop pass |
+| `--max-pages` | int | 200 | Cap on total pages visited |
+| `--no-bfs` | flag | BFS on | Disable link discovery; crawl only seedUrls |
+| `--persist` | `file` / `beads` / `none` | `file` | Where to store final report |
 
 ## Output
 
-A markdown table with columns:
-- **URL** — full page path
-- **Viewport** — desktop or mobile
+Markdown table:
+- **URL** — full page URL
+- **Viewport** — desktop / mobile
 - **Issue Description** — what was found
-- **Severity** — Low / Medium / High (see rubric below)
+- **Severity** — Low / Medium / High
 
-Plus a coverage summary: total pages visited, total screenshots taken, and any pages that returned HTTP 4xx/5xx.
+Plus coverage summary: pages visited, screenshots taken, counts per severity.
+
+Report also written to `tmp/session-*/visual-qa/report.md` (unless `--persist none`).
 
 ## Severity Rubric
 
 | Severity | Definition |
 |----------|-----------|
-| High | Content invisible, inaccessible, or broken layout makes page unusable |
-| Medium | Visual defect noticeable by a user but content is still readable/accessible |
-| Low | Minor polish issue (minor misalignment, slight overflow, cosmetic) |
-
-## Important Notes
-
-- **No cookie banner:** This site has no GDPR/consent overlay, so no dismissal step is needed.
-- **Don't interact with overlays:** Mobile hamburger and language-switch both open full-screen sheets that cover page content — they remain closed during the crawl so the default page is captured.
-- **StatCounter animations:** Counters show 0 before scroll-into-view. The crawl scrolls to bottom before screenshotting to ensure StatCounter animations complete.
-- **Alpine.js components:** FAQ, ContactForm, Quickcheck widgets are captured in their idle/initial state (appropriate for a crawl).
-- **Dev server required:** Crawl runs on `http://localhost:4321` (local dev with HMR). Falls back to production if dev is not running.
+| High | Content invisible/inaccessible OR layout makes page unusable |
+| Medium | Visible defect, content still readable/accessible |
+| Low | Cosmetic / minor misalignment / slight overflow |
 
 ## Under the Hood
 
-This skill spawns a Haiku 4.5 agent that:
-1. Validates the dev server is running (via `bun run check:dev-server`)
-2. Loads agent-browser CLI command reference (`agent-browser skills get core`)
-3. **Initialises the progress log** (see "Progress visibility" below): `LOG="$(source ~/.claude/skills/_progress.sh && progress_init visual-qa)"`
-4. Manages a queue of URLs from the seed list (all production pages across NL/EN/DE + internal component pages); emits `progress_emit "$LOG" "queue $N urls"` once the queue is built
-5. For each URL (index `i` of total `N`):
-   - Opens the page and waits for networkidle
-   - Takes a desktop screenshot (1280×900) after scrolling to trigger lazy-loaded content; emits `progress_emit "$LOG" "crawl $i/$N $url desktop"`
-   - Takes a mobile screenshot (393×878) with the same scroll pattern; emits `progress_emit "$LOG" "crawl $i/$N $url mobile"`
-   - Extracts links to discover new pages (filtered to same domain)
-   - Analyzes both screenshots with vision to identify UI issues
-6. Logs all findings with URL, viewport, description, and severity
-7. Calls `progress_done "$LOG"` and returns a markdown issues table and coverage summary when the queue is empty
+Spawned agent:
+1. Parses `$ARGS`, resolves config.
+2. Runs `devCheckCmd` if configured. Falls back to `fallbackUrl` on failure.
+3. Loads agent-browser command reference (`agent-browser skills get core`).
+4. Initialises progress log via `~/.claude/skills/_progress.sh`.
+5. Builds seed queue (config seeds × locale expansion, filtered by `--locale` / `--page`).
+6. Per URL:
+   - Opens, waits networkidle
+   - Checks `document.title` for error markers (404/500/Error)
+   - Desktop: viewport set, scroll bottom→top to trigger lazy content, full-page screenshot
+   - Overflow scan via `el.scrollWidth > el.clientWidth + 1` on configured selectors
+   - Link extraction (desktop only), filtered to base domain, deduped against queue + visited
+   - Mobile: same pass at mobile viewport
+   - Vision analysis on screenshots, augmented with `extraDesktopChecks` / `extraMobileChecks`
+7. State backed by files (`queue.txt`, `visited.txt`, `issues.jsonl`) — survives partial failures.
+8. Emits progress + checkpoints every 5 URLs.
+9. On empty queue: closes browser, writes report, calls `progress_done`.
 
-**Escalation:** If Haiku fails to load a screenshot or produces malformed analysis, the prompt instructs escalation to Sonnet.
+**Retry policy:** any agent-browser command that fails twice is logged + skipped. No infinite loops.
 
-## Progress visibility
+## Progress Visibility
 
-This skill blocks the parent agent for several minutes; the parent cannot stream output back. To surface live progress, the skill writes a structured log to `tmp/session-*/skill-visual-qa.log` via the shared helper at `~/.claude/skills/_progress.sh`.
+Blocks the parent agent for minutes on large sites. Live progress streamed via `tmp/session-*/skill-visual-qa.log`.
 
-**Helper API (sourced once, near skill start):**
+**Helper API** (sourced once near skill start):
 ```bash
 source ~/.claude/skills/_progress.sh
-LOG="$(progress_init visual-qa)"   # truncates log, writes [startup], returns path
-progress_emit "$LOG" "<message>"   # appends one timestamped line
-progress_done "$LOG"               # writes [done] + creates $LOG.done sentinel
+LOG="$(progress_init visual-qa)"
+progress_emit "$LOG" "<message>"
+progress_done "$LOG"
 ```
 
-**Watching progress:**
-- **Automatic:** the user-global SessionStart hook `~/.claude/hooks/skill-progress-tail.sh` background-tails `tmp/session-*/skill-*.log` and pipes each new line through `~/.claude/hooks/notify.sh` → Ghostty bell + status line.
-- **Manual fallback** (any second terminal):
+**Watching progress**
+- **Automatic:** SessionStart hook `~/.claude/hooks/skill-progress-tail.sh` background-tails `tmp/session-*/skill-*.log` and pipes new lines through `notify.sh` (terminal bell + status line).
+- **Manual fallback:**
   ```bash
   tail -F tmp/session-*/skill-visual-qa.log
   ```
 
-**Crash detection:** absence of `[done]` line + missing `$LOG.done` sentinel after the log goes quiet for >30s indicates the crawl crashed mid-run.
+**Crash detection:** missing `[done]` line + no `$LOG.done` sentinel after >30s silence → crash mid-run.
+
+## Screenshot Storage
+
+```
+tmp/session-<YYYY-MM-DD-HHMMSS>/visual-qa/<slug>-desktop.png
+tmp/session-<YYYY-MM-DD-HHMMSS>/visual-qa/<slug>-mobile.png
+tmp/session-<YYYY-MM-DD-HHMMSS>/visual-qa/report.md
+```
+
+Slug rule: strip leading/trailing `/`, replace remaining `/` with `-`. Empty → `home`.
+
+Session dirs auto-created by `.claude/hooks/create-session-dir.sh` and auto-cleaned on session end.
 
 ## Examples
 
-**Full crawl (all locales, both viewports):**
+**Full crawl, repo config:**
 ```bash
 /visual-qa-crawl
 ```
 
-**Quick mobile audit (all pages, mobile only):**
+**Different base URL, mobile only:**
 ```bash
-/visual-qa-crawl --mobile-only
-```
-
-**Spot-check one page (all viewports):**
-```bash
-/visual-qa-crawl --page contact
+/visual-qa-crawl --base-url http://localhost:5173 --mobile-only
 ```
 
 **Single locale, desktop only:**
@@ -131,16 +163,16 @@ progress_done "$LOG"               # writes [done] + creates $LOG.done sentinel
 /visual-qa-crawl --locale de --desktop-only
 ```
 
-## Screenshot Storage
-
-Screenshots are saved to the session temp directory:
-```
-tmp/session-<YYYY-MM-DD-HHMMSS>/visual-qa/<slug>-desktop.png
-tmp/session-<YYYY-MM-DD-HHMMSS>/visual-qa/<slug>-mobile.png
+**Spot-check one page across all locales:**
+```bash
+/visual-qa-crawl --page contact
 ```
 
-Session temp dirs are auto-created by the `.claude/hooks/create-session-dir.sh` hook and auto-cleaned after the session ends (unless you explicitly keep the dir).
+**Bound run on large site, no link discovery:**
+```bash
+/visual-qa-crawl --no-bfs --max-pages 30
+```
 
 ---
 
-**Next step:** Run `/visual-qa-crawl` (or with options above) to start the crawl.
+**Next step:** drop `visual-qa.config.json` in the target repo (or pass `--base-url`), then run `/visual-qa-crawl`.
